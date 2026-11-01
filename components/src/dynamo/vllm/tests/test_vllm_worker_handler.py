@@ -2892,6 +2892,57 @@ class TestEmbeddingWorkerHandlerCancellation:
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(5)
+    async def test_vllm_rejected_request_is_invalid_argument(self):
+        """A request vLLM rejects at ``encode`` (here ``dimensions`` on a model
+        without Matryoshka support) surfaces as a 400 with vLLM's message, not
+        as an internal server error.
+        """
+        from vllm.exceptions import VLLMValidationError
+
+        handler = self._make_embedding_handler()
+        context = self._make_context()
+        message = (
+            "Model 'test-model' does not support Matryoshka embeddings; "
+            "dimensions must be unset (received dimensions=512)."
+        )
+
+        async def fake_encode(prompt, pooling_params, request_id):
+            raise VLLMValidationError(message, parameter="dimensions", value=512)
+            yield  # pragma: no cover - makes this an async generator
+
+        handler.engine_client.encode = fake_encode
+
+        request = {"input": ["a", "b"], "model": "test-model", "dimensions": 512}
+        with pytest.raises(mod.InvalidArgument, match="does not support Matryoshka"):
+            async for _ in handler.generate(request, context):
+                pass
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(5)
+    async def test_vllm_non_400_client_error_keeps_status(self):
+        """vLLM client errors other than 400 keep their own status."""
+        from vllm.exceptions import VLLMNotFoundError
+
+        from dynamo.llm.exceptions import HttpError
+
+        handler = self._make_embedding_handler()
+        context = self._make_context()
+
+        async def fake_encode(prompt, pooling_params, request_id):
+            raise VLLMNotFoundError("adapter not found")
+            yield  # pragma: no cover - makes this an async generator
+
+        handler.engine_client.encode = fake_encode
+
+        with pytest.raises(HttpError) as exc_info:
+            async for _ in handler.generate(
+                {"input": ["a"], "model": "test-model"}, context
+            ):
+                pass
+        assert exc_info.value.code == 404
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(5)
     async def test_raw_text_truncation_forwarded_to_vllm(self):
         """Raw text inputs forward ``truncate_prompt_tokens`` to vLLM's
         tokenizer path, including the ``-1`` sentinel vLLM accepts.

@@ -4999,9 +4999,22 @@ class EmbeddingWorkerHandler:
         # ``_encode_one`` raises, we cancel siblings still in flight instead
         # of leaving them running -- otherwise vLLM keeps consuming engine
         # capacity for output that this handler will discard.
+        from vllm.exceptions import VLLMClientError
+
+        from .errors import vllm_client_error_to_http_error
+
         tasks = [asyncio.create_task(_encode_one(i, p)) for i, p in enumerate(prompts)]
         try:
             outputs = await asyncio.gather(*tasks)
+        except VLLMClientError as exc:
+            # Requests vLLM rejects (e.g. ``dimensions`` on a model without
+            # Matryoshka support) keep vLLM's status instead of surfacing as a
+            # 500. A 400 is raised as ``InvalidArgument``, the only error whose
+            # message the frontend passes on to the client.
+            http_error = vllm_client_error_to_http_error(exc)
+            if http_error.code == 400:
+                raise InvalidArgument(str(exc)) from exc
+            raise http_error from exc
         finally:
             pending = [t for t in tasks if not t.done()]
             for t in pending:
