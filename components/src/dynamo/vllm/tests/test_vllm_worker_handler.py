@@ -10,8 +10,10 @@
 import asyncio
 import base64
 import json
+import sqlite3
 from contextlib import asynccontextmanager, nullcontext
 from types import SimpleNamespace
+from typing import Optional
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import numpy as np
@@ -25,6 +27,7 @@ from dynamo.common.memory.multimodal_embedding_cache_manager import (
     MultimodalEmbeddingCacheManager,
 )
 from dynamo.health_check import HEALTH_CHECK_KEY
+from dynamo.llm.exceptions import HttpError
 from dynamo.vllm.health_check import VllmPrefillHealthCheckPayload
 from dynamo.vllm.multimodal_utils.protocol import (
     PatchedTokensPrompt,
@@ -108,6 +111,7 @@ def _make_config(
     config.embedding_transfer_mode = EmbeddingTransferMode.LOCAL
     config.enable_multimodal = enable_multimodal
     config.enable_rl = False
+    config.artifact_router_profile = None
     config.multimodal_embedding_cache_capacity_gb = (
         multimodal_embedding_cache_capacity_gb
     )
@@ -1019,6 +1023,513 @@ async def test_engine_data_uses_effective_engine_prompt(
         assert metadata["completion_logprobs"] == pytest.approx([-0.1, -0.2])
     else:
         assert "engine_data" not in chunks[-1]
+
+
+@pytest.mark.asyncio
+async def test_generate_captures_artifact_without_emitting_raw_routes(monkeypatch):
+    from dynamo.artifacts.vllm import capture as artifact_capture
+    from dynamo.artifacts.vllm.format import decode_generation_artifact
+
+    handler = _make_decode_handler(disaggregation_mode="AGGREGATED")
+    handler.use_vllm_tokenizer = False
+    handler.artifact_router_profile = ((3, 8, 2),)
+    handler.config.engine_args.enable_return_routed_experts = True
+    handler.engine_args = handler.config.engine_args
+    handler._to_local_dp_rank = MagicMock(return_value=None)
+    handler._resolve_lora_request = MagicMock(return_value=None)
+    handler._extract_logprobs = MagicMock(return_value=(None, None))
+    handler._abort_monitor = MagicMock(return_value=nullcontext())
+    request = {
+        "model": "test-model",
+        "token_ids": [10, 11],
+        "sampling_options": {},
+        "stop_conditions": {"max_tokens": 1},
+        "output_options": {},
+        "extra_args": {
+            "nvext": {
+                "metadata_upload": {
+                    "kind": "generation_artifact",
+                    "mode": "inline_base64",
+                    "contents": ["moe_routes", "selected_logprobs"],
+                }
+            }
+        },
+    }
+    handler._multimodal_request_processor.prepare_input = AsyncMock(
+        return_value=PreparedMultimodalInput(
+            request=request, multi_modal_data=None, mm_processor_kwargs=None
+        )
+    )
+    handler._build_prompt_from_request = MagicMock(
+        return_value=PatchedTokensPrompt(prompt_token_ids=[10, 11])
+    )
+    routed = np.asarray([[[1, 2]], [[3, 4]]], dtype=np.int64)
+    observed = {}
+
+    async def fake_generate(*args, **kwargs):
+        observed["logprobs"] = args[1].logprobs
+        yield SimpleNamespace(
+            prompt_token_ids=[10, 11],
+            prompt_logprobs=None,
+            num_cached_tokens=None,
+            outputs=[
+                SimpleNamespace(
+                    index=0,
+                    token_ids=[12],
+                    logprobs=[{12: Logprob(logprob=-0.2)}],
+                    routed_experts=routed,
+                    finish_reason="stop",
+                    stop_reason=None,
+                )
+            ],
+        )
+
+    handler.engine_client = SimpleNamespace(generate=fake_generate, tokenizer=None)
+    context = MagicMock()
+    context.id.return_value = "artifact-request"
+    chunks = [chunk async for chunk in handler.generate(request, context)]
+
+    assert len(chunks) == 1
+    assert observed["logprobs"] == 1
+    assert chunks[0]["token_ids"] == [12]
+    assert "routed_experts" not in chunks[0].get("engine_data", {})
+    artifact = chunks[0]["engine_data"]["metadata_upload"]
+    assert artifact["kind"] == "generation_artifact"
+    assert artifact["mode"] == "inline_base64"
+    choice = decode_generation_artifact(
+        base64.b64decode(artifact["data_base64"])
+    ).choices[0]
+    assert choice.sequence_token_ids.as_array().tolist() == [10, 11, 12]
+    assert {type(component).__name__ for component in choice.components} == {
+        "MoeRoutes",
+        "SelectedLogprobs",
+    }
+
+    monkeypatch.setattr(
+        artifact_capture,
+        "process_capture_budget",
+        lambda: artifact_capture.CaptureBudget(1),
+    )
+    with pytest.raises(mod.WorkerOverloaded, match="capture capacity"):
+        async for _ in handler.generate(request, context):
+            pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    (
+        "engine_finish_reason",
+        "expected_finish_reason",
+        "should_submit",
+        "submit_error",
+        "client_logprobs",
+    ),
+    [
+        ("abort", "cancelled", False, None, None),
+        ("error: engine failed", "error: engine failed", False, None, None),
+        ("stop", "stop", True, None, None),
+        ("stop", "stop", True, sqlite3.OperationalError("database is locked"), None),
+        ("stop", "stop", True, None, 1025),
+    ],
+)
+async def test_artifact_terminal_delivery_only_on_success(
+    monkeypatch,
+    engine_finish_reason,
+    expected_finish_reason,
+    should_submit,
+    submit_error,
+    client_logprobs,
+):
+    from dynamo.artifacts.vllm import capture as artifact_capture
+
+    handler = _make_decode_handler(disaggregation_mode="AGGREGATED")
+    handler.use_vllm_tokenizer = False
+    handler.artifact_router_profile = ()
+    handler.engine_args = handler.config.engine_args
+    handler._to_local_dp_rank = MagicMock(return_value=None)
+    handler._resolve_lora_request = MagicMock(return_value=None)
+    handler._extract_logprobs = MagicMock(return_value=(None, None))
+    handler._abort_monitor = MagicMock(return_value=nullcontext())
+    request = {
+        "model": "test-model",
+        "token_ids": [10, 11],
+        "sampling_options": {},
+        "stop_conditions": {"max_tokens": 2},
+        "output_options": (
+            {"logprobs": client_logprobs} if client_logprobs is not None else {}
+        ),
+        "extra_args": {
+            "nvext": {
+                "metadata_upload": {
+                    "kind": "generation_artifact",
+                    "mode": "object_store",
+                    "contents": [],
+                    "destination": {"url": "https://example.invalid/upload"},
+                }
+            }
+        },
+    }
+    handler._multimodal_request_processor.prepare_input = AsyncMock(
+        return_value=PreparedMultimodalInput(
+            request=request, multi_modal_data=None, mm_processor_kwargs=None
+        )
+    )
+    handler._build_prompt_from_request = MagicMock(
+        return_value=PatchedTokensPrompt(prompt_token_ids=[10, 11])
+    )
+    receipt = {
+        "kind": "generation_artifact",
+        "mode": "object_store",
+        "format": "generation_artifact_v1",
+        "contents": [],
+        "state": "pending",
+        "operation_id": "test-operation",
+    }
+    runtime = SimpleNamespace(
+        validate=MagicMock(), submit=AsyncMock(return_value=receipt)
+    )
+    if submit_error is not None:
+        runtime.submit.side_effect = submit_error
+    budget = artifact_capture.CaptureBudget(1 << 20)
+    monkeypatch.setattr(artifact_capture, "process_capture_budget", lambda: budget)
+    monkeypatch.setattr(
+        "dynamo.artifacts.runtime.configured_artifact_runtime", lambda: runtime
+    )
+    observations = []
+    observe_async = artifact_capture.VllmArtifactSession.observe_async
+
+    async def track_observation(self, output, prompt_token_ids):
+        observations.append(output.finish_reason)
+        await observe_async(self, output, prompt_token_ids)
+
+    monkeypatch.setattr(
+        artifact_capture.VllmArtifactSession, "observe_async", track_observation
+    )
+
+    async def fake_generate(*args, **kwargs):
+        for token, reason in ((12, None), (13, engine_finish_reason)):
+            yield SimpleNamespace(
+                prompt_token_ids=[10, 11],
+                prompt_logprobs=None,
+                num_cached_tokens=None,
+                outputs=[
+                    SimpleNamespace(
+                        index=0,
+                        token_ids=[token],
+                        logprobs=None,
+                        routed_experts=None,
+                        finish_reason=reason,
+                        stop_reason=None,
+                    )
+                ],
+            )
+
+    handler.engine_client = SimpleNamespace(generate=fake_generate, tokenizer=None)
+    context = MagicMock()
+    context.id.return_value = "artifact-request"
+
+    chunks = [chunk async for chunk in handler.generate(request, context)]
+
+    assert chunks[-1]["finish_reason"] == expected_finish_reason
+    if should_submit:
+        delivered = chunks[-1]["engine_data"]["metadata_upload"]
+        if submit_error is None:
+            assert delivered == receipt
+        else:
+            assert delivered["state"] == "failed"
+            assert delivered["error_code"] == "delivery_rejected"
+        runtime.submit.assert_awaited_once()
+        assert observations == [None, "stop"]
+    else:
+        assert "metadata_upload" not in chunks[-1].get("engine_data", {})
+        runtime.submit.assert_not_awaited()
+        assert observations == [None]
+    assert budget.used == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("output_options", "expected_top_count", "route_start"),
+    [({}, None, None), ({"logprobs": 0}, 0, None), ({"logprobs": 1}, 2, 99)],
+)
+async def test_artifact_logprobs_do_not_widen_client_output(
+    monkeypatch, output_options, expected_top_count, route_start
+):
+    from dynamo.artifacts.vllm.format import decode_generation_artifact
+
+    handler = _make_decode_handler(disaggregation_mode="AGGREGATED")
+    handler.use_vllm_tokenizer = False
+    handler.artifact_router_profile = ()
+    handler.engine_args = handler.config.engine_args
+    handler._to_local_dp_rank = MagicMock(return_value=None)
+    handler._resolve_lora_request = MagicMock(return_value=None)
+    handler._abort_monitor = MagicMock(return_value=nullcontext())
+    request = {
+        "model": "test-model",
+        "token_ids": [10, 11],
+        "sampling_options": {},
+        "stop_conditions": {"max_tokens": 1},
+        "output_options": output_options,
+        "extra_args": {
+            "nvext": {
+                "metadata_upload": {
+                    "kind": "generation_artifact",
+                    "mode": "inline_base64",
+                    "contents": ["selected_logprobs"],
+                }
+            }
+        },
+    }
+    handler._multimodal_request_processor.prepare_input = AsyncMock(
+        return_value=PreparedMultimodalInput(
+            request=request, multi_modal_data=None, mm_processor_kwargs=None
+        )
+    )
+    handler._build_prompt_from_request = MagicMock(
+        return_value=PatchedTokensPrompt(prompt_token_ids=[10, 11])
+    )
+    observed = {}
+
+    async def fake_generate(*args, **kwargs):
+        observed["logprobs"] = args[1].logprobs
+        yield SimpleNamespace(
+            prompt_token_ids=[10, 11],
+            prompt_logprobs=None,
+            num_cached_tokens=None,
+            outputs=[
+                SimpleNamespace(
+                    index=0,
+                    token_ids=[12],
+                    logprobs=[
+                        {
+                            12: Logprob(logprob=-0.2),
+                            13: Logprob(logprob=-0.3),
+                        }
+                    ],
+                    routed_experts=None,
+                    finish_reason="stop",
+                    stop_reason=None,
+                )
+            ],
+        )
+
+    handler.engine_client = SimpleNamespace(generate=fake_generate, tokenizer=None)
+    if route_start is not None:
+        build = mod.build_sampling_params
+
+        def with_route_start(*args, **kwargs):
+            sampling = build(*args, **kwargs)
+            sampling.routed_experts_prompt_start = route_start
+            return sampling
+
+        monkeypatch.setattr(mod, "build_sampling_params", with_route_start)
+    context = MagicMock()
+    context.id.return_value = "artifact-request"
+
+    chunks = [chunk async for chunk in handler.generate(request, context)]
+
+    assert observed["logprobs"] == 1
+    assert chunks[-1]["token_ids"] == [12]
+    artifact = chunks[-1]["engine_data"]["metadata_upload"]
+    choice = decode_generation_artifact(
+        base64.b64decode(artifact["data_base64"])
+    ).choices[0]
+    assert choice.components[0].logprobs.as_array().tolist() == pytest.approx([-0.2])
+    if expected_top_count is None:
+        assert "log_probs" not in chunks[-1]
+        assert "top_logprobs" not in chunks[-1]
+    else:
+        assert chunks[-1]["log_probs"] == pytest.approx([-0.2])
+        assert len(chunks[-1]["top_logprobs"][0]) == expected_top_count
+
+
+@pytest.mark.asyncio
+async def test_artifact_operation_status_validates_identifier_and_hides_store_errors(
+    monkeypatch,
+):
+    authority = SimpleNamespace(status=MagicMock(return_value={"state": "ready"}))
+    monkeypatch.setattr(
+        "dynamo.artifacts.runtime.configured_artifact_runtime", lambda: authority
+    )
+    handler = _make_decode_handler(disaggregation_mode="AGGREGATED")
+
+    for body in ({}, {"operation_id": 3}, {"operation_id": "x" * 129}):
+        assert await handler.artifact_operation_status(body) == {
+            "status": "error",
+            "message": "invalid operation identifier",
+        }
+    authority.status.assert_not_called()
+
+    assert await handler.artifact_operation_status({"operation_id": "known"}) == {
+        "state": "ready"
+    }
+    authority.status.assert_called_once_with("known")
+
+    authority.status.side_effect = KeyError("missing")
+    assert await handler.artifact_operation_status({"operation_id": "missing"}) == {
+        "status": "error",
+        "message": "operation not found",
+    }
+
+    authority.status.side_effect = sqlite3.OperationalError("database is locked")
+    assert await handler.artifact_operation_status({"operation_id": "known"}) == {
+        "status": "error",
+        "message": "artifact status unavailable",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("authority_state", ["missing", "closing"])
+async def test_artifact_authority_unavailable_returns_typed_error(
+    monkeypatch, authority_state
+):
+    from dynamo.artifacts.runtime import ArtifactAuthorityClosed
+
+    handler = _make_decode_handler(disaggregation_mode="AGGREGATED")
+    handler.use_vllm_tokenizer = False
+    handler.artifact_router_profile = ()
+    handler.engine_args = handler.config.engine_args
+    handler._to_local_dp_rank = MagicMock(return_value=None)
+    handler._resolve_lora_request = MagicMock(return_value=None)
+    request = {
+        "model": "test-model",
+        "token_ids": [10, 11],
+        "sampling_options": {},
+        "stop_conditions": {"max_tokens": 1},
+        "output_options": {},
+        "extra_args": {
+            "nvext": {
+                "metadata_upload": {
+                    "kind": "generation_artifact",
+                    "mode": "object_store",
+                    "contents": [],
+                    "destination": {"kind": "managed_store"},
+                }
+            }
+        },
+    }
+    handler._multimodal_request_processor.prepare_input = AsyncMock(
+        return_value=PreparedMultimodalInput(
+            request=request, multi_modal_data=None, mm_processor_kwargs=None
+        )
+    )
+    handler._build_prompt_from_request = MagicMock(
+        return_value=PatchedTokensPrompt(prompt_token_ids=[10, 11])
+    )
+    authority = None
+    if authority_state == "closing":
+        authority = SimpleNamespace(
+            validate=MagicMock(side_effect=ArtifactAuthorityClosed("closed"))
+        )
+    monkeypatch.setattr(
+        "dynamo.artifacts.runtime.configured_artifact_runtime", lambda: authority
+    )
+    expected = (
+        mod.InvalidArgument if authority_state == "missing" else mod.WorkerOverloaded
+    )
+    with pytest.raises(expected):
+        async for _ in handler.generate(request, MagicMock()):
+            pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("code", "client_error"),
+    [
+        ("destination_denied", True),
+        ("invalid_target", True),
+        ("expired", True),
+        ("unsupported", False),
+    ],
+)
+async def test_artifact_destination_rejection_is_invalid_argument(
+    monkeypatch, code, client_error
+):
+    from dynamo.artifacts.storage import ArtifactStorageError
+    from dynamo.artifacts.vllm import capture as artifact_capture
+
+    handler = _make_decode_handler(disaggregation_mode="AGGREGATED")
+    handler.use_vllm_tokenizer = False
+    handler.artifact_router_profile = ()
+    handler.engine_args = handler.config.engine_args
+    handler._to_local_dp_rank = MagicMock(return_value=None)
+    handler._resolve_lora_request = MagicMock(return_value=None)
+    request = {
+        "model": "test-model",
+        "token_ids": [10, 11],
+        "sampling_options": {},
+        "stop_conditions": {"max_tokens": 1},
+        "output_options": {},
+        "extra_args": {
+            "nvext": {
+                "metadata_upload": {
+                    "kind": "generation_artifact",
+                    "mode": "object_store",
+                    "contents": [],
+                    "destination": {"kind": "managed_store"},
+                }
+            }
+        },
+    }
+    handler._multimodal_request_processor.prepare_input = AsyncMock(
+        return_value=PreparedMultimodalInput(
+            request=request, multi_modal_data=None, mm_processor_kwargs=None
+        )
+    )
+    handler._build_prompt_from_request = MagicMock(
+        return_value=PatchedTokensPrompt(prompt_token_ids=[10, 11])
+    )
+    authority = SimpleNamespace(
+        validate=MagicMock(side_effect=ArtifactStorageError(code, "policy says no")),
+        submit=AsyncMock(),
+    )
+    monkeypatch.setattr(
+        "dynamo.artifacts.runtime.configured_artifact_runtime", lambda: authority
+    )
+    budget = artifact_capture.CaptureBudget(1 << 20)
+    monkeypatch.setattr(artifact_capture, "process_capture_budget", lambda: budget)
+    handler.engine_client = SimpleNamespace(generate=MagicMock(), tokenizer=None)
+
+    expected = mod.InvalidArgument if client_error else ArtifactStorageError
+    with pytest.raises(expected, match="policy says no"):
+        async for _ in handler.generate(request, MagicMock()):
+            pass
+    handler.engine_client.generate.assert_not_called()
+    authority.submit.assert_not_called()
+    assert budget.used == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("worker_mode", "message"),
+    [
+        ("text", "token-in/token-out"),
+        ("prefill", "prefill-only worker"),
+    ],
+)
+async def test_artifact_request_rejects_unsupported_worker_mode(worker_mode, message):
+    request = {
+        "token_ids": [10, 11],
+        "extra_args": {
+            "nvext": {
+                "metadata_upload": {
+                    "kind": "generation_artifact",
+                    "mode": "inline_base64",
+                    "contents": [],
+                }
+            }
+        },
+    }
+    if worker_mode == "text":
+        handler = _make_decode_handler(disaggregation_mode="AGGREGATED")
+        handler.use_vllm_tokenizer = True
+        generate = handler.generate(request, MagicMock())
+    else:
+        generate = mod.PrefillWorkerHandler.generate(MagicMock(), request, MagicMock())
+
+    with pytest.raises(mod.InvalidArgument, match=message):
+        async for _ in generate:
+            pass
 
 
 @pytest.mark.asyncio(loop_scope="function")
@@ -2601,6 +3112,321 @@ class TestEmbeddingWorkerHandlerCancellation:
         with pytest.raises(ValueError, match="exceeds model embedding dimension"):
             async for _ in handler.generate(request, context):
                 pass
+
+
+class TestEmbeddingWorkerHandlerChatInput:
+    """Chat-style (``messages``) embedding requests are rendered by vLLM's
+    renderer and the rendered prompts are encoded unchanged, one per
+    conversation."""
+
+    IMAGE_CONVERSATION = [
+        {
+            "role": "document",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,AAAA"},
+                },
+                {"type": "text", "text": "a chart"},
+            ],
+        }
+    ]
+    AUDIO_CONVERSATION = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "input_audio",
+                    "input_audio": {"data": "AAAA", "format": "wav"},
+                }
+            ],
+        }
+    ]
+
+    def _make_handler(self, custom_jinja_template=None):
+        with patch.object(mod, "VllmEngineMonitor"):
+            handler = mod.EmbeddingWorkerHandler(
+                runtime=MagicMock(),
+                engine=MagicMock(),
+                config=MagicMock(
+                    served_model_name="test-model",
+                    custom_jinja_template=custom_jinja_template,
+                ),
+                shutdown_event=None,
+            )
+        handler.engine_client = MagicMock()
+        handler.engine_client.abort = AsyncMock()
+        handler.engine_client.model_config.multimodal_config = None
+        handler.engine_client.renderer.tokenizer = object()
+        encoded: list = []
+
+        async def fake_encode(prompt, pooling_params, request_id):
+            encoded.append((prompt, pooling_params))
+            output = MagicMock()
+            output.outputs.data = torch.tensor([float(prompt["index"]), 0.5])
+            output.prompt_token_ids = prompt["prompt_token_ids"]
+            yield output
+
+        handler.engine_client.encode = fake_encode
+        return handler, encoded
+
+    @staticmethod
+    def _make_context(stopped: Optional[asyncio.Future] = None) -> MagicMock:
+        """Like the real Context, each ``async_killed_or_stopped()`` call
+        returns a new future; the first one is ``stopped`` when given."""
+        loop = asyncio.get_running_loop()
+        first = [stopped] if stopped is not None else []
+        context = MagicMock()
+        context.id.return_value = "test-req"
+        context.async_killed_or_stopped.side_effect = lambda: (
+            first.pop() if first else loop.create_future()
+        )
+        return context
+
+    @staticmethod
+    def _rendered(conversations):
+        # Stand-ins for vLLM's rendered engine inputs; image and audio
+        # placeholders expand to several prompt tokens each.
+        return list(conversations), [
+            {"index": i, "prompt_token_ids": list(range(10 + i))}
+            for i in range(len(conversations))
+        ]
+
+    async def _generate(self, handler, request, context=None):
+        tok_params = object()
+        with (
+            patch(
+                "vllm.entrypoints.pooling.embed.protocol.EmbeddingChatRequest.build_tok_params",
+                return_value=tok_params,
+            ),
+            patch(
+                "vllm.entrypoints.pooling.embed.protocol.EmbeddingBatchChatRequest.build_tok_params",
+                return_value=tok_params,
+            ),
+        ):
+            responses = [
+                r
+                async for r in handler.generate(
+                    request, context or self._make_context()
+                )
+            ]
+        return responses, tok_params
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(5)
+    async def test_conversation_is_rendered_and_encoded(self):
+        handler, encoded = self._make_handler()
+        render = AsyncMock(side_effect=lambda convs, *_: self._rendered(convs))
+        handler.engine_client.renderer.render_chat_async = render
+
+        responses, tok_params = await self._generate(
+            handler,
+            {
+                "model": "test-model",
+                "messages": self.IMAGE_CONVERSATION,
+                "dimensions": 2,
+            },
+        )
+
+        conversations, chat_params, passed_tok_params = render.await_args.args
+        assert len(conversations) == 1
+        assert conversations[0][0]["role"] == "document"
+        assert chat_params.chat_template is None  # the model's own template
+        assert passed_tok_params is tok_params
+        # The rendered prompt reaches the engine unchanged, as an embed task.
+        assert [prompt for prompt, _ in encoded] == [
+            {"index": 0, "prompt_token_ids": list(range(10))}
+        ]
+        assert encoded[0][1].task == "embed"
+        assert encoded[0][1].dimensions == 2
+
+        assert len(responses) == 1
+        response = responses[0]
+        assert [item["index"] for item in response["data"]] == [0]
+        assert response["data"][0]["embedding"] == mod._encode_floats_to_base64(
+            [0.0, 0.5]
+        )
+        assert response["usage"] == {"prompt_tokens": 10, "total_tokens": 10}
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(5)
+    async def test_batch_keeps_conversation_order(self):
+        handler, encoded = self._make_handler()
+        render = AsyncMock(side_effect=lambda convs, *_: self._rendered(convs))
+        handler.engine_client.renderer.render_chat_async = render
+
+        responses, _ = await self._generate(
+            handler,
+            {
+                "model": "test-model",
+                "messages": [self.IMAGE_CONVERSATION, self.AUDIO_CONVERSATION],
+            },
+        )
+
+        conversations = render.await_args.args[0]
+        assert [conv[0]["role"] for conv in conversations] == ["document", "user"]
+        assert len(encoded) == 2
+        data = responses[0]["data"]
+        assert [item["index"] for item in data] == [0, 1]
+        assert data[1]["embedding"] == mod._encode_floats_to_base64([1.0, 0.5])
+        assert responses[0]["usage"]["prompt_tokens"] == 10 + 11
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(5)
+    async def test_custom_jinja_template_is_used(self, tmp_path):
+        template = tmp_path / "embed.jinja"
+        template.write_text("{{ messages[0]['content'] }}")
+        handler, _ = self._make_handler(custom_jinja_template=str(template))
+        render = AsyncMock(side_effect=lambda convs, *_: self._rendered(convs))
+        handler.engine_client.renderer.render_chat_async = render
+
+        await self._generate(
+            handler,
+            {
+                "model": "test-model",
+                "messages": [{"role": "query", "content": "hello"}],
+            },
+        )
+
+        chat_params = render.await_args.args[1]
+        assert chat_params.chat_template == "{{ messages[0]['content'] }}"
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(5)
+    async def test_invalid_message_is_rejected_before_encoding(self):
+        handler, encoded = self._make_handler()
+        handler.engine_client.renderer.render_chat_async = AsyncMock()
+
+        with pytest.raises(mod.InvalidArgument, match="content"):
+            await self._generate(
+                handler,
+                {"model": "test-model", "messages": [{"role": "user", "content": 5}]},
+            )
+        handler.engine_client.renderer.render_chat_async.assert_not_awaited()
+        assert encoded == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(5)
+    @pytest.mark.parametrize(
+        ("case", "expected_status"),
+        [
+            ("text_only_model", None),
+            ("unsupported_modality", 400),
+            ("media_not_loadable", 422),
+        ],
+    )
+    async def test_vllm_rejection_is_a_client_error(self, case, expected_status):
+        """vLLM's rejection is a client error, not a 500. Typed vLLM client
+        errors keep their status through the shared mapper, as on the other
+        vLLM paths, so a media URL that can't be loaded is a 422; other
+        validation failures are InvalidArgument with vLLM's message."""
+        from vllm.exceptions import VLLMUnprocessableEntityError, VLLMValidationError
+
+        error = {
+            # vLLM on a text-only model given media (a plain ValueError).
+            "text_only_model": ValueError("test-model is not a multimodal model"),
+            # vLLM on a model without the modality.
+            "unsupported_modality": VLLMValidationError(
+                "At most 0 audio(s) may be provided in one prompt.",
+                parameter="audio",
+            ),
+            # vLLM when a media URL returns 404.
+            "media_not_loadable": VLLMUnprocessableEntityError(
+                "Failed to load media from URL", parameter="image_url"
+            ),
+        }[case]
+        handler, encoded = self._make_handler()
+        handler.engine_client.renderer.render_chat_async = AsyncMock(side_effect=error)
+
+        expected_type = mod.InvalidArgument if expected_status is None else HttpError
+        with pytest.raises(expected_type) as exc_info:
+            await self._generate(
+                handler,
+                {"model": "test-model", "messages": self.AUDIO_CONVERSATION},
+            )
+        if expected_status is not None:
+            assert exc_info.value.code == expected_status
+        assert str(error) in str(exc_info.value)
+        assert exc_info.value.__cause__ is error
+        assert encoded == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(5)
+    async def test_engine_rejection_is_a_client_error(self):
+        """A conversation that renders but that the engine rejects (e.g. an
+        embedding template that renders roles it doesn't know as an empty
+        prompt) is a 400, as with ``vllm serve``, not a 500."""
+        from vllm.exceptions import VLLMValidationError
+
+        error = VLLMValidationError(
+            "The decoder prompt cannot be empty", parameter="prompt"
+        )
+        handler, _ = self._make_handler()
+        handler.engine_client.renderer.render_chat_async = AsyncMock(
+            side_effect=lambda convs, *_: self._rendered(convs)
+        )
+
+        async def rejecting_encode(**_kwargs):
+            raise error
+            yield  # pragma: no cover - makes this an async generator
+
+        handler.engine_client.encode = rejecting_encode
+
+        with pytest.raises(HttpError) as exc_info:
+            await self._generate(
+                handler,
+                {
+                    "model": "test-model",
+                    "messages": [{"role": "query", "content": "hello"}],
+                },
+            )
+        assert exc_info.value.code == 400
+        assert str(error) in str(exc_info.value)
+        assert exc_info.value.__cause__ is error
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(5)
+    @pytest.mark.parametrize("signal", ["request_stopped", "worker_shutdown"])
+    async def test_stop_during_render_cancels_it_and_skips_encoding(self, signal):
+        """A client disconnect or worker shutdown while the media is still
+        being loaded cancels the render instead of leaving it running until
+        it finishes or times out, and nothing is encoded."""
+        handler, encoded = self._make_handler()
+        handler.shutdown_event = asyncio.Event()
+        stopped = asyncio.get_running_loop().create_future()
+        render_started = asyncio.Event()
+        render_cancelled = asyncio.Event()
+
+        async def blocked_render(*_):
+            render_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                render_cancelled.set()
+                raise
+
+        handler.engine_client.renderer.render_chat_async = blocked_render
+        generate = asyncio.create_task(
+            self._generate(
+                handler,
+                {"model": "test-model", "messages": self.IMAGE_CONVERSATION},
+                context=self._make_context(stopped),
+            )
+        )
+        await render_started.wait()
+
+        if signal == "request_stopped":
+            stopped.set_result(True)
+            # Not an empty stream, which would aggregate to a successful
+            # response with no embeddings.
+            with pytest.raises(mod.Cancelled):
+                await generate
+        else:
+            handler.shutdown_event.set()
+            with pytest.raises(mod.EngineShutdown):
+                await generate
+        assert render_cancelled.is_set()
+        assert encoded == []
 
 
 class TestRLAdminRouteHardening:
